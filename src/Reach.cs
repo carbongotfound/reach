@@ -16,10 +16,11 @@ using System.Threading;
 using System.Windows.Automation;
 using System.Windows.Forms;
 using System.Web.Script.Serialization;
+using Microsoft.Win32;
 
 static class Paths
 {
-    public const string Version = "0.2.0";
+    public const string Version = "0.2.1";
     // REACH_HOME lets you run a second, isolated instance (own config, token, port).
     public static readonly string Dir = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("REACH_HOME"))
         ? Environment.GetEnvironmentVariable("REACH_HOME")
@@ -90,6 +91,7 @@ sealed class Config
     public bool AgentCursor = true;
     public bool CursorRipple = true;
     public bool PauseOnUser = true;
+    public bool AutoPath = true;
     public int UserPauseIdleMs = 2000;
     public int UserPauseTimeoutMs = 60000;
     public string Motion = "smooth";   // smooth | fast | instant
@@ -130,7 +132,8 @@ sealed class Config
                     if (d.ContainsKey("userPauseIdleMs")) Current.UserPauseIdleMs = Convert.ToInt32(d["userPauseIdleMs"]);
                     if (d.ContainsKey("userPauseTimeoutMs")) Current.UserPauseTimeoutMs = Convert.ToInt32(d["userPauseTimeoutMs"]);
                     if (d.ContainsKey("motion")) Current.Motion = Convert.ToString(d["motion"]);
-                    foreach (var k in new[] { "port", "maxDim", "paused", "agentCursor", "cursorRipple", "pauseOnUser", "userPauseIdleMs", "userPauseTimeoutMs", "motion" })
+                    if (d.ContainsKey("autoPath")) Current.AutoPath = Convert.ToBoolean(d["autoPath"]);
+                    foreach (var k in new[] { "port", "maxDim", "paused", "agentCursor", "cursorRipple", "pauseOnUser", "userPauseIdleMs", "userPauseTimeoutMs", "motion", "autoPath" })
                         if (!d.ContainsKey(k)) needSave = true;
                 }
             }
@@ -154,6 +157,7 @@ sealed class Config
             d["userPauseIdleMs"] = Current.UserPauseIdleMs;
             d["userPauseTimeoutMs"] = Current.UserPauseTimeoutMs;
             d["motion"] = Current.Motion;
+            d["autoPath"] = Current.AutoPath;
             File.WriteAllText(Paths.Config, ser.Serialize(d));
         }
         catch { }
@@ -1087,6 +1091,32 @@ sealed class Engine
         ok("long text capped", baseMs * n <= 12000.5);
         FastThisCall = true; string fm = MotionMode(); FastThisCall = false;
         ok("--fast", Config.Current.Motion != "smooth" || fm == "fast");
+        // user PATH logic, against a scratch registry key (your real PATH is never touched)
+        string realKey = UserPath.KeyName;
+        UserPath.KeyName = @"Software\ReachSelfTest\Environment";
+        try
+        {
+            using (var rk = Registry.CurrentUser.CreateSubKey(UserPath.KeyName))
+                rk.SetValue("Path", @"C:\A;%SystemRoot%\x;C:\Tools\reach\;", RegistryValueKind.ExpandString);
+            ok("path dup (trailing slash)", !UserPath.Add(@"C:\Tools\reach"));
+            ok("path dup (case)", !UserPath.Add(@"c:\tools\REACH"));
+            ok("path add", UserPath.Add(@"D:\New Dir"));
+            ok("path add again", !UserPath.Add(@"D:\New Dir"));
+            ok("path contains", UserPath.Contains(@"D:\New Dir\"));
+            string v; RegistryValueKind kind; UserPath.Read(out v, out kind);
+            ok("path keeps vars + kind", v == @"C:\A;%SystemRoot%\x;C:\Tools\reach\;D:\New Dir" && kind == RegistryValueKind.ExpandString);
+            ok("path remove", UserPath.Remove(@"d:\new dir"));
+            UserPath.Read(out v, out kind);
+            ok("path restored", v == @"C:\A;%SystemRoot%\x;C:\Tools\reach\");
+            using (var rk = Registry.CurrentUser.CreateSubKey(UserPath.KeyName)) rk.DeleteValue("Path");
+            ok("path from empty", UserPath.Add(@"E:\x") && UserPath.Contains(@"E:\x"));
+        }
+        catch (Exception ex) { fail++; sb.AppendLine("FAIL path: " + ex.Message); }
+        finally
+        {
+            try { Registry.CurrentUser.DeleteSubKeyTree(@"Software\ReachSelfTest", false); } catch { }
+            UserPath.KeyName = realKey;
+        }
         sb.Append(pass + " passed, " + fail + " failed");
         return sb.ToString();
     }
@@ -2948,8 +2978,10 @@ Pause on user
   reach pause-on-user on | off | status | idle <ms> | timeout <ms>
   --no-yield                              act now even if you are using the PC
   --fast                                  quick glides and bulk typing for this call
+  --no-path                               don't add reach's folder to your PATH this run
 
 Server
+  reach path add | remove | status            reach's folder on your user PATH
   reach status [--json] | pause | resume | usage | serve | help");
     }
 }
@@ -3716,6 +3748,120 @@ static class ReachLogo
     }
 }
 
+// Puts reach's own folder on the user PATH (HKCU\Environment), no admin needed.
+// Never touches the system PATH. Keeps %VARS% and the value type as they are.
+static class UserPath
+{
+    public static string KeyName = "Environment";
+    static bool IsReal { get { return KeyName == "Environment"; } }
+
+    public static string ExeDir
+    {
+        get { return Path.GetDirectoryName(System.Reflection.Assembly.GetExecutingAssembly().Location); }
+    }
+
+    static string Norm(string p)
+    {
+        p = (p ?? "").Trim().Trim('"');
+        try { p = Path.GetFullPath(Environment.ExpandEnvironmentVariables(p)); } catch { }
+        return p.TrimEnd('\\').ToLowerInvariant();
+    }
+
+    public static void Read(out string val, out RegistryValueKind kind)
+    {
+        val = ""; kind = RegistryValueKind.ExpandString;
+        using (var k = Registry.CurrentUser.OpenSubKey(KeyName, false))
+        {
+            if (k == null) return;
+            object o = k.GetValue("Path", null, RegistryValueOptions.DoNotExpandEnvironmentNames);
+            if (o == null) return;
+            val = o as string ?? "";
+            var vk = k.GetValueKind("Path");
+            kind = vk == RegistryValueKind.String ? RegistryValueKind.String : RegistryValueKind.ExpandString;
+        }
+    }
+
+    static void Write(string val, RegistryValueKind kind)
+    {
+        using (var k = Registry.CurrentUser.CreateSubKey(KeyName)) k.SetValue("Path", val, kind);
+        if (IsReal) Broadcast();
+    }
+
+    public static bool Contains(string dir)
+    {
+        string v; RegistryValueKind kind; Read(out v, out kind);
+        string n = Norm(dir);
+        foreach (var e in v.Split(';')) if (e.Trim().Length > 0 && Norm(e) == n) return true;
+        return false;
+    }
+
+    public static bool Add(string dir)
+    {
+        string v; RegistryValueKind kind; Read(out v, out kind);
+        string n = Norm(dir);
+        foreach (var e in v.Split(';')) if (e.Trim().Length > 0 && Norm(e) == n) return false;
+        string nv = v.TrimEnd(' ', ';');
+        nv = nv.Length == 0 ? dir : nv + ";" + dir;
+        if (nv.Length > 32000) return false;
+        Write(nv, kind);
+        return true;
+    }
+
+    public static bool Remove(string dir)
+    {
+        string v; RegistryValueKind kind; Read(out v, out kind);
+        string n = Norm(dir);
+        var keep = new List<string>();
+        bool hit = false;
+        foreach (var e in v.Split(';'))
+        {
+            if (e.Trim().Length > 0 && Norm(e) == n) { hit = true; continue; }
+            keep.Add(e);
+        }
+        if (!hit) return false;
+        Write(string.Join(";", keep.ToArray()).TrimEnd(';'), kind);
+        return true;
+    }
+
+    // Runs on every start unless --no-path / autoPath false. Prints one line only when it adds.
+    public static void Ensure()
+    {
+        if (!Config.Current.AutoPath) return;
+        try
+        {
+            string d = ExeDir;
+            if (Add(d)) Console.WriteLine("Added " + d + " to PATH, open a new terminal");
+        }
+        catch (Exception ex) { Log.Write("path: " + ex.Message); }
+    }
+
+    public static int Cmd(string[] args)
+    {
+        string a = args.Length > 1 ? args[1].ToLowerInvariant() : "status";
+        string d = ExeDir;
+        if (a == "add")
+        {
+            Config.Current.AutoPath = true; Config.Save();
+            Console.WriteLine(Add(d) ? "Added " + d + " to PATH, open a new terminal" : d + " is already on PATH");
+        }
+        else if (a == "remove")
+        {
+            Config.Current.AutoPath = false; Config.Save();
+            Console.WriteLine(Remove(d) ? "Removed " + d + " from PATH (auto-add off)" : d + " wasn't on PATH (auto-add off)");
+        }
+        else Console.WriteLine(d + (Contains(d) ? " is on" : " is not on") + " your PATH, auto-add " + (Config.Current.AutoPath ? "on" : "off"));
+        return 0;
+    }
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    static extern IntPtr SendMessageTimeout(IntPtr h, uint msg, IntPtr w, string l, uint flags, uint timeout, out IntPtr result);
+    static void Broadcast()
+    {
+        IntPtr r;
+        try { SendMessageTimeout(new IntPtr(0xffff), 0x1A /*WM_SETTINGCHANGE*/, IntPtr.Zero, "Environment", 0x2 /*ABORTIFHUNG*/, 2000, out r); } catch { }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Pause-on-user: a passive low-level keyboard + mouse hook (never blocks, always
 // calls the next hook) notes the last physical (non-injected) input. Before any
@@ -3876,6 +4022,16 @@ static class Program
         RebindConsole();
         Directory.CreateDirectory(Paths.Dir);
         Config.Load();
+
+        bool noPath = false;
+        var kept = new List<string>();
+        foreach (var x in args) { if (x == "--no-path") noPath = true; else kept.Add(x); }
+        args = kept.ToArray();
+        string c0 = args.Length > 0 ? args[0].ToLowerInvariant() : "";
+        if (c0 == "path") return UserPath.Cmd(args);
+        if (!noPath && Environment.GetEnvironmentVariable("REACH_HOME") == null
+            && c0 != "selftest" && c0 != "pill-preview" && c0 != "logo")
+            UserPath.Ensure();
 
         if (args.Length >= 1 && args[0].Equals("selftest", StringComparison.OrdinalIgnoreCase))
         {
