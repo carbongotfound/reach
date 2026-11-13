@@ -1,0 +1,13 @@
+# build output
+*.exe
+*.pdb
+bin/
+obj/
+# local test homes / runtime data (config + token live in %USERPROFILE%\.reach)
+.testhome/
+.reach/
+*.jpg
+*.log
+*.jsonl
+token
+config.json
