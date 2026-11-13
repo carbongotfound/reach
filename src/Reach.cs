@@ -19,7 +19,7 @@ using System.Web.Script.Serialization;
 
 static class Paths
 {
-    public const string Version = "0.1.0";
+    public const string Version = "0.2.0";
     // REACH_HOME lets you run a second, isolated instance (own config, token, port).
     public static readonly string Dir = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("REACH_HOME"))
         ? Environment.GetEnvironmentVariable("REACH_HOME")
@@ -92,6 +92,7 @@ sealed class Config
     public bool PauseOnUser = true;
     public int UserPauseIdleMs = 2000;
     public int UserPauseTimeoutMs = 60000;
+    public string Motion = "smooth";   // smooth | fast | instant
     public string Token = "";
 
     public static Config Current = new Config();
@@ -128,7 +129,8 @@ sealed class Config
                     if (d.ContainsKey("pauseOnUser")) Current.PauseOnUser = Convert.ToBoolean(d["pauseOnUser"]);
                     if (d.ContainsKey("userPauseIdleMs")) Current.UserPauseIdleMs = Convert.ToInt32(d["userPauseIdleMs"]);
                     if (d.ContainsKey("userPauseTimeoutMs")) Current.UserPauseTimeoutMs = Convert.ToInt32(d["userPauseTimeoutMs"]);
-                    foreach (var k in new[] { "port", "maxDim", "paused", "agentCursor", "cursorRipple", "pauseOnUser", "userPauseIdleMs", "userPauseTimeoutMs" })
+                    if (d.ContainsKey("motion")) Current.Motion = Convert.ToString(d["motion"]);
+                    foreach (var k in new[] { "port", "maxDim", "paused", "agentCursor", "cursorRipple", "pauseOnUser", "userPauseIdleMs", "userPauseTimeoutMs", "motion" })
                         if (!d.ContainsKey(k)) needSave = true;
                 }
             }
@@ -151,6 +153,7 @@ sealed class Config
             d["pauseOnUser"] = Current.PauseOnUser;
             d["userPauseIdleMs"] = Current.UserPauseIdleMs;
             d["userPauseTimeoutMs"] = Current.UserPauseTimeoutMs;
+            d["motion"] = Current.Motion;
             File.WriteAllText(Paths.Config, ser.Serialize(d));
         }
         catch { }
@@ -222,6 +225,9 @@ static class Native
 
     [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
     [DllImport("user32.dll", SetLastError = true)] public static extern uint SendInput(uint n, INPUT[] i, int cb);
+    [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
+    [DllImport("winmm.dll")] public static extern uint timeBeginPeriod(uint p);
+    [DllImport("winmm.dll")] public static extern uint timeEndPeriod(uint p);
     [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT p);
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int n);
@@ -410,19 +416,32 @@ sealed class Engine
     }
 
     [ThreadStatic] static bool NoYieldThisCall;
+    [ThreadStatic] static bool FastThisCall;
+    static readonly Random rng = new Random();
+    static double Rand() { lock (rng) return rng.NextDouble(); }
+
+    // smooth (default): eased, curved glides and paced typing. fast: short glides, bulk typing. instant: teleport.
+    static string MotionMode()
+    {
+        string m = (Config.Current.Motion ?? "smooth").ToLowerInvariant();
+        if (m != "fast" && m != "instant") m = "smooth";
+        if (FastThisCall && m == "smooth") m = "fast";
+        return m;
+    }
 
     ActResult DispatchAs(string tool, string action, Dictionary<string, object> args)
     {
         AgentCursor.Current = AgentCursor.Resolve(args, null);
         AgentCursor.NoCursorThisCall = Bool(args, "no_cursor", false);
         NoYieldThisCall = Bool(args, "no_yield", false);
+        FastThisCall = Bool(args, "fast", false);
         try { return Dispatch(tool, action, args); }
-        finally { AgentCursor.NoCursorThisCall = false; NoYieldThisCall = false; }
+        finally { AgentCursor.NoCursorThisCall = false; NoYieldThisCall = false; FastThisCall = false; }
     }
 
     static bool IsPauseExempt(string tool, string action)
     {
-        if (tool == "status" || tool == "usage" || tool == "pause_on_user") return true;
+        if (tool == "status" || tool == "usage" || tool == "pause_on_user" || tool == "motion") return true;
         if (tool == "apps" && (action == "resume" || action == "status")) return true;
         return action == "resume" || action == "status" || action == "usage";
     }
@@ -439,6 +458,13 @@ sealed class Engine
             case "status": return Status(Bool(a, "json", false));
             case "cursor": return CursorCmd(action, a);
             case "pause_on_user": return PauseOnUserCmd(action, a);
+            case "motion":
+                {
+                    string v = Str(a, "value", Str(a, "action", "")).ToLowerInvariant();
+                    if (v == "smooth" || v == "fast" || v == "instant") { Config.Current.Motion = v; Config.Save(); }
+                    else if (v != "" && v != "status") return ActResult.Fail("motion is smooth, fast or instant");
+                    return ActResult.Say("motion " + MotionMode());
+                }
             case "usage": return ActResult.Say(Usage.Tail(Int(a, "limit", 20)));
             case "pause":
                 Config.Current.Paused = true; Config.Save();
@@ -494,8 +520,18 @@ sealed class Engine
                 Config.Current.AgentCursor = false; Config.Save();
                 AgentCursor.HideAll();
                 return ActResult.Say("agent cursor off");
+            case "capture":
+                {
+                    // Debug: let screen recorders see the pill (off by default).
+                    string v = Str(a, "value", "").ToLowerInvariant();
+                    AgentCursor.SetCaptureVisible(v == "on");
+                    return ActResult.Say("pill visible to capture: " + (v == "on" ? "yes" : "no"));
+                }
             case "show": case "test":
-                AgentCursor.AtCursor("click");
+                {
+                    string k = Str(a, "value", "click").ToLowerInvariant();
+                    AgentCursor.AtCursor(k == "type" || k == "move" ? k : "click");
+                }
                 return ActResult.Say("showing agent cursor for " + AgentCursor.Current);
             default:
                 return ActResult.Say("agent cursor " + (Config.Current.AgentCursor ? "on" : "off") + ", ripple " + (Config.Current.CursorRipple ? "on" : "off"));
@@ -723,44 +759,104 @@ sealed class Engine
 
     ActResult Click(ScreenMap map, int x, int y, string button, int times)
     {
+        bool smooth = MotionMode() == "smooth";
         MoveTo(map.ToScreen(x, y));
         AgentCursor.At(map.ToScreen(x, y), "click");
-        Thread.Sleep(25);
+        Thread.Sleep(smooth ? 35 : 15);
         uint down, up;
         if (button == "right") { down = Native.MOUSEEVENTF_RIGHTDOWN; up = Native.MOUSEEVENTF_RIGHTUP; }
         else if (button == "middle") { down = Native.MOUSEEVENTF_MIDDLEDOWN; up = Native.MOUSEEVENTF_MIDDLEUP; }
         else { down = Native.MOUSEEVENTF_LEFTDOWN; up = Native.MOUSEEVENTF_LEFTUP; }
         for (int i = 0; i < times; i++)
         {
-            Native.Send(new[] { MouseInput(0, 0, 0, down), MouseInput(0, 0, 0, up) });
-            if (i + 1 < times) Thread.Sleep(60);
+            Native.Send(new[] { MouseInput(0, 0, 0, down) });
+            try { Thread.Sleep(smooth ? 45 + (int)(Rand() * 30) : 8); }   // press/release gap
+            finally { Native.Send(new[] { MouseInput(0, 0, 0, up) }); }
+            if (i + 1 < times) Thread.Sleep(smooth ? 70 : 40);
         }
         return ActResult.Say("ok");
     }
 
     ActResult Drag(ScreenMap map, int x1, int y1, int x2, int y2)
     {
+        bool smooth = MotionMode() == "smooth";
         MoveTo(map.ToScreen(x1, y1));
         AgentCursor.At(map.ToScreen(x1, y1), "click");
-        Thread.Sleep(30);
+        Thread.Sleep(smooth ? 60 : 30);
         Native.Send(new[] { MouseInput(0, 0, 0, Native.MOUSEEVENTF_LEFTDOWN) });
-        Thread.Sleep(30);
-        MoveTo(map.ToScreen(x2, y2));
-        AgentCursor.At(map.ToScreen(x2, y2), "move");
-        Thread.Sleep(30);
-        Native.Send(new[] { MouseInput(0, 0, 0, Native.MOUSEEVENTF_LEFTUP) });
+        try
+        {
+            Thread.Sleep(smooth ? 70 : 30);
+            MoveTo(map.ToScreen(x2, y2), 1.5);
+            AgentCursor.At(map.ToScreen(x2, y2), "move");
+            Thread.Sleep(smooth ? 70 : 30);
+        }
+        finally { Native.Send(new[] { MouseInput(0, 0, 0, Native.MOUSEEVENTF_LEFTUP) }); }
         return ActResult.Say("ok");
     }
 
-    static void MoveTo(Point screen)
+    static void MoveTo(Point screen) { MoveTo(screen, 1.0); }
+
+    // Glide the real cursor along an eased, slightly curved path (~120 Hz), then land
+    // exactly on the target and verify. If you grab the mouse mid-glide, it stops,
+    // waits for you, and resumes from wherever the cursor is.
+    static void MoveTo(Point target, double durScale)
+    {
+        string mode = MotionMode();
+        Native.POINT c;
+        if (mode != "instant" && Native.GetCursorPos(out c))
+        {
+            double dx = target.X - c.X, dy = target.Y - c.Y, d = Math.Sqrt(dx * dx + dy * dy);
+            if (d >= 3)
+            {
+                double ms = mode == "fast" ? Math.Min(120, 50 + d * 0.06) : Math.Min(450, 150 + d * 0.22);
+                ms *= durScale;
+                double off = (0.5 + Rand() * 0.5) * Math.Min(60, d * 0.12) * (Rand() < 0.5 ? -1 : 1);
+                if (mode == "fast") off *= 0.4;
+                double kx = (c.X + target.X) / 2.0 - dy / d * off, ky = (c.Y + target.Y) / 2.0 + dx / d * off;
+                bool interrupted = false;
+                Native.timeBeginPeriod(1);
+                try
+                {
+                    var sw = Stopwatch.StartNew();
+                    int lx = int.MinValue, ly = int.MinValue;
+                    while (true)
+                    {
+                        double t = Math.Min(1.0, sw.Elapsed.TotalMilliseconds / ms);
+                        double e = t < 0.5 ? 4 * t * t * t : 1 - Math.Pow(-2 * t + 2, 3) / 2;   // ease-in-out
+                        double u = 1 - e;
+                        int ix = (int)Math.Round(u * u * c.X + 2 * u * e * kx + e * e * target.X);
+                        int iy = (int)Math.Round(u * u * c.Y + 2 * u * e * ky + e * e * target.Y);
+                        if (ix != lx || iy != ly) { SendAbs(ix, iy); lx = ix; ly = iy; }
+                        if (t >= 1) break;
+                        if (!NoYieldThisCall && Config.Current.PauseOnUser && UserYield.IdleMs < 120) { interrupted = true; break; }
+                        Thread.Sleep(8);
+                    }
+                }
+                finally { Native.timeEndPeriod(1); }
+                if (interrupted)
+                {
+                    UserYield.WaitForIdle(AgentCursor.Current);
+                    MoveTo(target, durScale);
+                    return;
+                }
+            }
+        }
+        SendAbs(target.X, target.Y);
+        // Re-verify the landing spot; absolute coordinates can round off by a pixel.
+        Native.POINT f;
+        if (Native.GetCursorPos(out f) && (f.X != target.X || f.Y != target.Y))
+            Native.SetCursorPos(target.X, target.Y);
+    }
+
+    static void SendAbs(int x, int y)
     {
         var vs = SystemInformation.VirtualScreen;
-        int nx = (int)Math.Round((screen.X - vs.X) * 65535.0 / Math.Max(1, vs.Width - 1));
-        int ny = (int)Math.Round((screen.Y - vs.Y) * 65535.0 / Math.Max(1, vs.Height - 1));
+        int nx = (int)Math.Round((x - vs.X) * 65535.0 / Math.Max(1, vs.Width - 1));
+        int ny = (int)Math.Round((y - vs.Y) * 65535.0 / Math.Max(1, vs.Height - 1));
         if (nx < 0) nx = 0; if (nx > 65535) nx = 65535;
         if (ny < 0) ny = 0; if (ny > 65535) ny = 65535;
-        var inp = MouseInput(nx, ny, 0, Native.MOUSEEVENTF_MOVE | Native.MOUSEEVENTF_ABSOLUTE | Native.MOUSEEVENTF_VIRTUALDESK);
-        Native.Send(new[] { inp });
+        Native.Send(new[] { MouseInput(nx, ny, 0, Native.MOUSEEVENTF_MOVE | Native.MOUSEEVENTF_ABSOLUTE | Native.MOUSEEVENTF_VIRTUALDESK) });
     }
 
     static Native.INPUT MouseInput(int dx, int dy, uint data, uint flags)
@@ -789,10 +885,18 @@ sealed class Engine
             case "key":
             case "press":
                 if (string.IsNullOrEmpty(text)) throw new Exception("`text` is a chord such as Return, ctrl+s, alt+Tab, or win.");
-                AgentCursor.AtCaret("type");
-                foreach (var chord in SplitChords(text))
-                    PressChord(chord);
-                return ActResult.Say("ok");
+                {
+                    int hold = Math.Max(0, Math.Min(10000, Int(a, "hold", 0)));
+                    var chords = SplitChords(text);
+                    for (int i = 0; i < chords.Length; i++)
+                    {
+                        if (i > 0 && !NoYieldThisCall) UserYield.WaitForIdle(AgentCursor.Current);
+                        AgentCursor.AtCursor("key:" + ChordLabel(chords[i]));
+                        PressChord(chords[i], hold);
+                        if (i + 1 < chords.Length) Thread.Sleep(MotionMode() == "smooth" ? 120 : 30);
+                    }
+                    return ActResult.Say("ok");
+                }
             case "hold":
             case "hold_key":
                 {
@@ -808,33 +912,73 @@ sealed class Engine
         }
     }
 
+    // "ctrl+shift+t", "ctrl+c, ctrl+v", "ctrl+a Delete", "ctrl + s"
     static string[] SplitChords(string text)
     {
-        // "ctrl+s alt+Tab Return" — space-separated chords
-        return text.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+        var list = new List<string>();
+        foreach (var seg in text.Split(','))
+        {
+            string t = Regex.Replace(seg.Trim(), @"\s*\+\s*", "+");
+            foreach (var p in t.Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries)) list.Add(p);
+        }
+        return list.ToArray();
     }
 
+    static string ChordLabel(string chord)
+    {
+        var parts = chord.Split(new[] { '+' }, StringSplitOptions.RemoveEmptyEntries);
+        for (int i = 0; i < parts.Length; i++)
+        {
+            string p = parts[i].Trim().ToLowerInvariant();
+            if (p == "control") p = "ctrl";
+            if (p == "return") p = "enter";
+            if (p == "escape") p = "esc";
+            if (p == "super" || p == "meta" || p == "cmd" || p == "windows") p = "win";
+            parts[i] = p.Length <= 1 ? p.ToUpperInvariant() : char.ToUpperInvariant(p[0]) + p.Substring(1);
+        }
+        return string.Join(" + ", parts);
+    }
+
+    // smooth: real per-character key events at a visible pace (~25-45 ms, jittered), checking
+    // pause-on-user as it goes. fast/instant: bulk chunks of 20 characters.
     static void TypeText(string text)
     {
+        bool smooth = MotionMode() == "smooth";
+        double baseMs = 35;
+        if (smooth && text.Length * baseMs > 12000) baseMs = Math.Max(4, 12000.0 / text.Length);  // long text: keep it under ~12 s
         var list = new List<Native.INPUT>();
-        foreach (char ch in text)
+        int n = 0;
+        if (smooth) Native.timeBeginPeriod(1);
+        try
         {
-            if (ch == '\r') continue;
-            if (ch == '\n')
+            foreach (char ch in text)
             {
-                PressVkInto(list, 0x0D, false); // Enter
-                continue;
+                if (ch == '\r') continue;
+                if (ch == '\n') PressVkInto(list, 0x0D, false); // Enter
+                else
+                {
+                    list.Add(KeyInput(0, ch, Native.KEYEVENTF_UNICODE));
+                    list.Add(KeyInput(0, ch, Native.KEYEVENTF_UNICODE | Native.KEYEVENTF_KEYUP));
+                }
+                n++;
+                if (smooth)
+                {
+                    Native.Send(list.ToArray());
+                    list.Clear();
+                    if (n % 20 == 0) AgentCursor.AtCursor("type");          // keep the pill awake
+                    if (!NoYieldThisCall && n % 4 == 0) UserYield.WaitForIdle(AgentCursor.Current);
+                    Thread.Sleep((int)Math.Round(baseMs * (0.72 + Rand() * 0.56)));
+                }
+                else if (list.Count >= 40)
+                {
+                    Native.Send(list.ToArray());
+                    list.Clear();
+                    if (!NoYieldThisCall) UserYield.WaitForIdle(AgentCursor.Current); // keys are all released here
+                }
             }
-            list.Add(KeyInput(0, ch, Native.KEYEVENTF_UNICODE));
-            list.Add(KeyInput(0, ch, Native.KEYEVENTF_UNICODE | Native.KEYEVENTF_KEYUP));
-            if (list.Count >= 40)
-            {
-                Native.Send(list.ToArray());
-                list.Clear();
-                if (!NoYieldThisCall) UserYield.WaitForIdle(AgentCursor.Current); // keys are all released here
-            }
+            if (list.Count > 0) Native.Send(list.ToArray());
         }
-        if (list.Count > 0) Native.Send(list.ToArray());
+        finally { if (smooth) Native.timeEndPeriod(1); }
     }
 
     static Native.INPUT KeyInput(ushort vk, ushort scan, uint flags)
@@ -854,45 +998,103 @@ sealed class Engine
         list.Add(KeyInput(vk, 0, f | Native.KEYEVENTF_KEYUP));
     }
 
-    static void PressChord(string chord)
+    // Modifiers down, then the key, then release in reverse order. Everything that went
+    // down is always released, even if something throws.
+    static void PressChord(string chord, int holdMs)
     {
         ushort[] mods;
         ushort key;
         bool ext;
         ParseChord(chord, out mods, out key, out ext);
-        var list = new List<Native.INPUT>();
-        foreach (var m in mods) list.Add(KeyInput(m, 0, 0));
-        uint f = ext ? Native.KEYEVENTF_EXTENDEDKEY : 0;
-        list.Add(KeyInput(key, 0, f));
-        list.Add(KeyInput(key, 0, f | Native.KEYEVENTF_KEYUP));
-        for (int i = mods.Length - 1; i >= 0; i--)
-            list.Add(KeyInput(mods[i], 0, Native.KEYEVENTF_KEYUP));
-        Native.Send(list.ToArray());
-        Thread.Sleep(20);
+        bool smooth = MotionMode() == "smooth";
+        int gap = smooth ? 25 : 0;
+        var downed = new List<KeyValuePair<ushort, uint>>();
+        try
+        {
+            foreach (var m in mods)
+            {
+                uint mf = m == 0x5B ? Native.KEYEVENTF_EXTENDEDKEY : 0;
+                Native.Send(new[] { KeyInput(m, 0, mf) });
+                downed.Add(new KeyValuePair<ushort, uint>(m, mf));
+                if (gap > 0) Thread.Sleep(gap);
+            }
+            uint f = ext ? Native.KEYEVENTF_EXTENDEDKEY : 0;
+            Native.Send(new[] { KeyInput(key, 0, f) });
+            downed.Add(new KeyValuePair<ushort, uint>(key, f));
+            int hold = holdMs > 0 ? holdMs : smooth ? 45 + (int)(Rand() * 25) : 0;
+            if (hold > 0) Thread.Sleep(hold);
+        }
+        finally
+        {
+            for (int i = downed.Count - 1; i >= 0; i--)
+            {
+                try { Native.Send(new[] { KeyInput(downed[i].Key, 0, downed[i].Value | Native.KEYEVENTF_KEYUP) }); } catch { }
+                if (gap > 0 && i > 0) Thread.Sleep(gap / 2);
+            }
+        }
+        Thread.Sleep(smooth ? 30 : 15);
     }
 
     static void HoldChord(string chord, double sec)
     {
-        ushort[] mods;
-        ushort key;
-        bool ext;
-        ParseChord(chord, out mods, out key, out ext);
-        var down = new List<Native.INPUT>();
-        foreach (var m in mods) down.Add(KeyInput(m, 0, 0));
-        uint f = ext ? Native.KEYEVENTF_EXTENDEDKEY : 0;
-        down.Add(KeyInput(key, 0, f));
-        Native.Send(down.ToArray());
-        Thread.Sleep((int)(sec * 1000));
-        var up = new List<Native.INPUT>();
-        up.Add(KeyInput(key, 0, f | Native.KEYEVENTF_KEYUP));
-        for (int i = mods.Length - 1; i >= 0; i--)
-            up.Add(KeyInput(mods[i], 0, Native.KEYEVENTF_KEYUP));
-        Native.Send(up.ToArray());
+        AgentCursor.AtCursor("key:" + ChordLabel(chord));
+        PressChord(chord, (int)(sec * 1000));
+    }
+
+    // reach selftest: offscreen checks of the input logic (nothing is sent to the OS).
+    public static string SelfTest()
+    {
+        var sb = new StringBuilder(); int pass = 0, fail = 0;
+        Action<string, bool> ok = (name, cond) => { if (cond) pass++; else { fail++; sb.AppendLine("FAIL " + name); } };
+        Func<string, string> split = t => string.Join("|", SplitChords(t));
+        ok("seq comma", split("ctrl+c, ctrl+v") == "ctrl+c|ctrl+v");
+        ok("spaced chord", split("ctrl + shift + t") == "ctrl+shift+t");
+        ok("space seq", split("ctrl+a Delete") == "ctrl+a|Delete");
+        ushort[] m; ushort k; bool e;
+        ParseChord("ctrl+shift+t", out m, out k, out e);
+        ok("ctrl+shift+t", m.Length == 2 && m[0] == 0x11 && m[1] == 0x10 && k == 0x54);
+        ParseChord("win+r", out m, out k, out e);
+        ok("win+r", m.Length == 1 && m[0] == 0x5B && k == 0x52);
+        ParseChord("shift", out m, out k, out e);
+        ok("bare shift", m.Length == 0 && k == 0x10);
+        ParseChord("alt+F4", out m, out k, out e);
+        ok("alt+F4", m.Length == 1 && m[0] == 0x12 && k == 0x73);
+        bool blocked = false; try { ParseChord("win+l", out m, out k, out e); } catch { blocked = true; }
+        ok("win+l blocked", blocked);
+        ok("label", ChordLabel("ctrl+shift+t") == "Ctrl + Shift + T" && ChordLabel("win+r") == "Win + R" && ChordLabel("control+Return") == "Ctrl + Enter");
+        // glide: ease endpoints and exact landing for any curve
+        var r = new Random(1);
+        bool land = true, mono = true, bounds = true;
+        for (int i = 0; i < 2000; i++)
+        {
+            double cx = r.Next(-1920, 1920), cy = r.Next(0, 1080), tx = r.Next(-1920, 1920), ty = r.Next(0, 1080);
+            double dx = tx - cx, dy = ty - cy, d = Math.Sqrt(dx * dx + dy * dy); if (d < 3) continue;
+            double off = (0.5 + r.NextDouble() * 0.5) * Math.Min(60, d * 0.12) * (r.Next(2) == 0 ? -1 : 1);
+            double kx = (cx + tx) / 2.0 - dy / d * off, ky = (cy + ty) / 2.0 + dx / d * off;
+            double prev = -1;
+            for (double t = 0; t <= 1.0001; t += 1 / 54.0)
+            {
+                double tt = Math.Min(1, t), ee = tt < 0.5 ? 4 * tt * tt * tt : 1 - Math.Pow(-2 * tt + 2, 3) / 2;
+                if (ee < prev - 1e-12) mono = false; prev = ee;
+            }
+            double u = 0; double ex = u * u * cx + 2 * u * 1 * kx + 1 * tx, ey = u * u * cy + 2 * u * 1 * ky + 1 * ty;
+            if ((int)Math.Round(ex) != (int)tx || (int)Math.Round(ey) != (int)ty) land = false;
+            double ms = Math.Min(450, 150 + d * 0.22);
+            if (ms < 150 || ms > 450) bounds = false;
+        }
+        ok("ease monotonic", mono); ok("lands exactly", land); ok("duration 150-450 ms", bounds);
+        double baseMs = 35; int n = 1000; if (n * baseMs > 12000) baseMs = Math.Max(4, 12000.0 / n);
+        ok("long text capped", baseMs * n <= 12000.5);
+        FastThisCall = true; string fm = MotionMode(); FastThisCall = false;
+        ok("--fast", Config.Current.Motion != "smooth" || fm == "fast");
+        sb.Append(pass + " passed, " + fail + " failed");
+        return sb.ToString();
     }
 
     static void ParseChord(string chord, out ushort[] mods, out ushort key, out bool ext)
     {
-        var parts = chord.Split(new[] { '+', '-' }, StringSplitOptions.RemoveEmptyEntries);
+        var parts = chord.Contains("+") || chord.Length < 3 ? chord.Split(new[] { '+' }, StringSplitOptions.RemoveEmptyEntries)
+                                                             : chord.Split(new[] { '+', '-' }, StringSplitOptions.RemoveEmptyEntries);
         var ml = new List<ushort>();
         key = 0;
         ext = false;
@@ -919,7 +1121,7 @@ sealed class Engine
             }
         }
         if (key == 0) throw new Exception("No key in chord `" + chord + "`.");
-        // Block Win+L (lock the PC) — Reach should not lock the machine.
+        // Block Win+L (lock the PC): Reach should not lock the machine.
         bool hasWin = ml.Contains(0x5B);
         if (hasWin && (key == 0x4C /*L*/))
             throw new Exception("Win+L is blocked so Reach cannot lock the PC.");
@@ -1161,7 +1363,7 @@ sealed class Engine
         name = name.Trim();
         if (!fresh)
         {
-            // If it's already open, just focus it — that's what you usually want.
+            // If it's already open, just focus it: that's what you usually want.
             var hits = new List<WinInfo>();
             string f = name.ToLowerInvariant();
             foreach (var info in EnumerateWindows())
@@ -1698,7 +1900,7 @@ sealed class Engine
         try { el.SetFocus(); } catch { }
         Thread.Sleep(50);
         // Select-all then type
-        PressChord("ctrl+a");
+        PressChord("ctrl+a", 0);
         Thread.Sleep(30);
         TypeText(value ?? "");
         return ActResult.Say("typed into " + id);
@@ -2207,13 +2409,16 @@ sealed class Server
                     Prop("to", "array", "drag end [x,y]"),
                     PropEnum("direction", "up, down, left, right", false),
                     Prop("amount", "integer", "scroll notches, default 3"),
-                    Prop("duration", "number", "wait seconds, max 10")
+                    Prop("duration", "number", "wait seconds, max 10"),
+                    Prop("fast", "boolean", "quick motion this call")
                 ), "action"),
-            Tool("keyboard", "Type text, or press chords like Return, ctrl+s, alt+Tab (space-separated).",
+            Tool("keyboard", "Type text, or press chords like Return, ctrl+shift+t, win+r; sequences \"ctrl+c, ctrl+v\".",
                 Props(
                     PropEnum("action", "type, key, hold", true),
                     Prop("text", "string", "text or chord"),
-                    Prop("duration", "number", "hold seconds, max 10")
+                    Prop("hold", "integer", "key: hold ms"),
+                    Prop("duration", "number", "hold seconds, max 10"),
+                    Prop("fast", "boolean", "quick typing this call")
                 ), "action"),
             Tool("ui", "Accessibility tree. find/inspect return refs (eN) for invoke, set, read, toggle, focus. ref may also be a control name.",
                 Props(
@@ -2281,7 +2486,7 @@ sealed class Tray : ApplicationContext
         this.Server = server;
         icon = new NotifyIcon();
         icon.Icon = MakeIcon(false);
-        icon.Text = "Reach — desktop control";
+        icon.Text = "Reach: desktop control";
         icon.Visible = true;
         icon.ContextMenuStrip = BuildMenu();
         icon.DoubleClick += delegate { ShowStatusBalloon(); };
@@ -2294,8 +2499,8 @@ sealed class Tray : ApplicationContext
                 try
                 {
                     icon.Icon = MakeIcon(p || Config.Current.Paused);
-                    icon.Text = p ? "Reach — paused, you're using the PC"
-                        : (Config.Current.Paused ? "Reach — paused" : "Reach — desktop control");
+                    icon.Text = p ? "Reach: paused, you're using the PC"
+                        : (Config.Current.Paused ? "Reach: paused" : "Reach: desktop control");
                 }
                 catch { }
             }, null);
@@ -2316,7 +2521,7 @@ sealed class Tray : ApplicationContext
             Config.Current.Paused = !Config.Current.Paused;
             Config.Save();
             icon.Icon = MakeIcon(Config.Current.Paused);
-            icon.Text = Config.Current.Paused ? "Reach — paused" : "Reach — desktop control";
+            icon.Text = Config.Current.Paused ? "Reach: paused" : "Reach: desktop control";
             icon.ContextMenuStrip = BuildMenu();
             icon.ShowBalloonTip(1500, "Reach", Config.Current.Paused ? "Paused. Nothing can control this PC until you resume." : "Running.", ToolTipIcon.Info);
         };
@@ -2357,23 +2562,7 @@ sealed class Tray : ApplicationContext
 
     static Icon MakeIcon(bool paused)
     {
-        var bmp = new Bitmap(32, 32, PixelFormat.Format32bppArgb);
-        using (var g = Graphics.FromImage(bmp))
-        {
-            g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
-            g.Clear(Color.Transparent);
-            Color fill = paused ? Color.FromArgb(255, 140, 60, 50) : Color.FromArgb(255, 20, 110, 150);
-            using (var br = new SolidBrush(fill))
-                g.FillEllipse(br, 1, 1, 30, 30);
-            using (var pen = new Pen(Color.White, 2.2f))
-            {
-                // A simple "reach" arrow / cursor
-                g.DrawLines(pen, new[] {
-                    new PointF(10, 22), new PointF(10, 9), new PointF(22, 21)
-                });
-                g.DrawLine(pen, 10, 9, 22, 9);
-            }
-        }
+        var bmp = ReachLogo.Render(32, paused);
         IntPtr h = bmp.GetHicon();
         var ic = Icon.FromHandle(h);
         var clone = (Icon)ic.Clone();
@@ -2399,13 +2588,14 @@ static class Cli
         if (cmd == "help" || cmd == "-h" || cmd == "--help") { PrintHelp(); return 0; }
 
         string agent = Environment.GetEnvironmentVariable("REACH_AGENT");
-        bool noCursor = false, noYield = false;
-        args = StripGlobalFlags(args, ref agent, ref noCursor, ref noYield);
+        bool noCursor = false, noYield = false, fast = false;
+        args = StripGlobalFlags(args, ref agent, ref noCursor, ref noYield, ref fast);
         if (args.Length == 0) { PrintHelp(); return 0; }
         cmd = args[0].ToLowerInvariant();
         var payload = BuildPayload(args);
-        if (!string.IsNullOrWhiteSpace(agent) || noCursor || noYield)
+        if (!string.IsNullOrWhiteSpace(agent) || noCursor || noYield || fast)
         {
+            if (fast) { var pf = Json.Deserialize<Dictionary<string, object>>(payload); pf["fast"] = true; payload = Json.Serialize(pf); }
             if (noYield) { var pd0 = Json.Deserialize<Dictionary<string, object>>(payload); pd0["no_yield"] = true; payload = Json.Serialize(pd0); }
             var pd = Json.Deserialize<Dictionary<string, object>>(payload);
             if (!string.IsNullOrWhiteSpace(agent)) pd["agent"] = agent.Trim();
@@ -2441,7 +2631,7 @@ static class Cli
 
     // --agent "<name>" and --no-cursor: anywhere before the command, and after it
     // too unless the command takes free text (type, key, open, ui, apps).
-    static string[] StripGlobalFlags(string[] args, ref string agent, ref bool noCursor, ref bool noYield)
+    static string[] StripGlobalFlags(string[] args, ref string agent, ref bool noCursor, ref bool noYield, ref bool fast)
     {
         var outList = new List<string>();
         string cmd = null;
@@ -2455,6 +2645,7 @@ static class Cli
                 if (a.StartsWith("--agent=")) { agent = a.Substring(8); continue; }
                 if (a == "--no-cursor") { noCursor = true; continue; }
                 if (a == "--no-yield") { noYield = true; continue; }
+                if (a == "--fast") { fast = true; continue; }
             }
             if (cmd == null) cmd = a.ToLowerInvariant();
             outList.Add(a);
@@ -2545,7 +2736,20 @@ static class Cli
                 d["tool"] = "keyboard"; d["action"] = "type"; d["text"] = Join(args, 1);
                 return Json.Serialize(d);
             case "key":
-                d["tool"] = "keyboard"; d["action"] = "key"; d["text"] = Join(args, 1);
+                {
+                    d["tool"] = "keyboard"; d["action"] = "key";
+                    var rest = new List<string>();
+                    for (int i = 1; i < args.Length; i++)
+                    {
+                        if (args[i] == "--hold" && i + 1 < args.Length) { d["hold"] = int.Parse(args[++i]); continue; }
+                        if (args[i] == "--fast") { d["fast"] = true; continue; }
+                        rest.Add(args[i]);
+                    }
+                    d["text"] = string.Join(" ", rest.ToArray());
+                    return Json.Serialize(d);
+                }
+            case "motion":
+                d["tool"] = "motion"; d["value"] = args.Length > 1 ? args[1].ToLowerInvariant() : "status";
                 return Json.Serialize(d);
             case "ui":
                 d["tool"] = "ui";
@@ -2725,7 +2929,8 @@ Screen
 Mouse and keyboard (screenshot image coordinates)
   reach click X Y | double-click X Y | right-click X Y | move X Y
   reach drag X1 Y1 X2 Y2 | scroll down 3 [X Y]
-  reach type hello world | key ctrl+s
+  reach type hello world | key ctrl+shift+t | key ""ctrl+c, ctrl+v"" | key win+r --hold 500
+  reach motion smooth | fast | instant        how input moves (default smooth)
 
 UI controls (preferred over pixels)
   reach ui find Save [--limit 25] [--json] [--all]
@@ -2735,13 +2940,14 @@ UI controls (preferred over pixels)
 
 Agent pill (name tag next to the real cursor while an agent acts)
   reach --agent ""Claude"" click X Y      or set REACH_AGENT
-  reach cursor on | off | status | show | ripple on|off
+  reach cursor on | off | status | show [move|type|click] | ripple on|off
   --no-cursor                             skip it for one command
   reach screenshot --include-overlay      debug: capture with it visible
 
 Pause on user
   reach pause-on-user on | off | status | idle <ms> | timeout <ms>
   --no-yield                              act now even if you are using the PC
+  --fast                                  quick glides and bulk typing for this call
 
 Server
   reach status [--json] | pause | resume | usage | serve | help");
@@ -2787,6 +2993,7 @@ static class AgentCursor
             var ready = new ManualResetEvent(false);
             thread = new Thread(delegate ()
             {
+                try { SetThreadDpiAwarenessContext(new IntPtr(-4)); } catch { } // per-monitor v2, crisp on every screen
                 var ctx = new WindowsFormsSynchronizationContext();
                 SynchronizationContext.SetSynchronizationContext(ctx);
                 hostCtx = ctx;
@@ -2818,6 +3025,105 @@ static class AgentCursor
     }
 
     [ThreadStatic] public static bool NoCursorThisCall;
+
+    // reach pill-preview --out DIR: renders the pill demo timeline to PNG frames (60 fps)
+    // plus stills, entirely offscreen. Also draws a fake desktop, a glide, typing and chords.
+    public static string Preview(string dir, string agent, float scale)
+    {
+        Directory.CreateDirectory(dir);
+        int W = (int)(560 * scale), H = (int)(230 * scale);
+        var pill = PillWindow.ForPreview(agent, scale, 900);
+        string typed = "hello from Reach";
+        // timeline (ms)
+        var A = new PointF(70 * scale, 60 * scale); var B = new PointF(250 * scale, 112 * scale);
+        int frames = 0;
+        var stills = new Dictionary<int, string> { { 760, "pill-still-move.png" }, { 1900, "pill-still-typing.png" }, { 3350, "pill-still-chord.png" }, { 5600, "pill-still-paused.png" } };
+        using (var bg = new Bitmap(W, H, PixelFormat.Format32bppArgb))
+        {
+            for (long t = 0; t <= 7600; t += 1000 / 60)
+            {
+                // events
+                if (t == 0) pill.SetClock(0);
+                pill.SetClock(t);
+                if (Hit(t, 0)) pill.Act("move");
+                if (Hit(t, 900)) pill.Act("click");
+                if (Hit(t, 1300)) pill.Act("type");
+                if (t > 1300 && t < 2700 && (t / 300) != ((t - 16) / 300)) pill.Act("type");
+                if (Hit(t, 3000)) pill.Act("key:Ctrl + Shift + T");
+                if (Hit(t, 3900)) pill.Act("key:Ctrl + C");
+                if (Hit(t, 4500)) pill.Act("key:Ctrl + V");
+                if (Hit(t, 5200)) pill.SetPaused(true);
+                if (Hit(t, 6300)) pill.SetPaused(false);
+                // cursor glide A -> B (eased, curved), like MoveTo
+                double gt = Math.Max(0, Math.Min(1, (t - 150) / 420.0));
+                double e = gt < 0.5 ? 4 * gt * gt * gt : 1 - Math.Pow(-2 * gt + 2, 3) / 2, u = 1 - e;
+                float kx = (A.X + B.X) / 2 + 20 * scale, ky = (A.Y + B.Y) / 2 - 40 * scale;
+                var c = new PointF((float)(u * u * A.X + 2 * u * e * kx + e * e * B.X), (float)(u * u * A.Y + 2 * u * e * ky + e * e * B.Y));
+                int n = t < 1300 ? 0 : (int)Math.Min(typed.Length, (t - 1300) / 70);
+                bool selected = t >= 3900 && t < 4500;
+                int ci = (int)Math.Round(c.X), cj = (int)Math.Round(c.Y);
+                bool vis = pill.Step(ci, cj, 0);
+                using (var g = Graphics.FromImage(bg))
+                {
+                    DrawBackdrop(g, W, H, scale, typed.Substring(0, n) + (t >= 4500 && t < 9999 ? "" : ""), selected, t);
+                    if (vis && pill.Frame != null && pill.PvAlpha > 0)
+                    {
+                        var cm = new ColorMatrix { Matrix33 = pill.PvAlpha / 255f };
+                        using (var ia = new ImageAttributes())
+                        {
+                            ia.SetColorMatrix(cm);
+                            var f = pill.Frame;
+                            g.DrawImage(f, new Rectangle(pill.PvX, pill.PvY, f.Width, f.Height), 0, 0, f.Width, f.Height, GraphicsUnit.Pixel, ia);
+                        }
+                    }
+                    DrawArrow(g, c.X, c.Y, scale);
+                }
+                bg.Save(Path.Combine(dir, "f" + frames.ToString("0000") + ".png"), ImageFormat.Png);
+                foreach (var kv in stills)
+                    if (Hit(t, kv.Key)) bg.Save(Path.Combine(dir, kv.Value), ImageFormat.Png);
+                frames++;
+            }
+        }
+        return frames + " frames at 60 fps, " + W + "x" + H + " -> " + dir;
+    }
+
+    static bool Hit(long t, long at) { return t <= at && at < t + 1000 / 60; }
+
+    static void DrawBackdrop(Graphics g, int W, int H, float s, string text, bool selected, long t)
+    {
+        g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.HighQuality;
+        g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
+        using (var br = new System.Drawing.Drawing2D.LinearGradientBrush(new Rectangle(0, 0, W, H), Color.FromArgb(205, 216, 236), Color.FromArgb(226, 214, 240), 20f))
+            g.FillRectangle(br, 0, 0, W, H);
+        var win = new RectangleF(150 * s, 70 * s, 360 * s, 120 * s);
+        using (var sh = new SolidBrush(Color.FromArgb(28, 20, 20, 40))) g.FillRectangle(sh, win.X + 2 * s, win.Y + 5 * s, win.Width, win.Height);
+        g.FillRectangle(Brushes.White, win);
+        using (var tb = new SolidBrush(Color.FromArgb(243, 244, 248))) g.FillRectangle(tb, win.X, win.Y, win.Width, 26 * s);
+        using (var f = new Font("Segoe UI", 11f * s, GraphicsUnit.Pixel))
+        using (var b = new SolidBrush(Color.FromArgb(90, 96, 110)))
+            g.DrawString("Untitled - Notes", f, b, win.X + 10 * s, win.Y + 6 * s);
+        var box = new RectangleF(win.X + 14 * s, win.Y + 40 * s, win.Width - 28 * s, 30 * s);
+        using (var p = new Pen(Color.FromArgb(150, 99, 120, 250), 1.5f * s)) g.DrawRectangle(p, box.X, box.Y, box.Width, box.Height);
+        using (var f = new Font("Segoe UI", 14f * s, GraphicsUnit.Pixel))
+        {
+            var sz = g.MeasureString(text, f);
+            if (selected && text.Length > 0)
+                using (var sb = new SolidBrush(Color.FromArgb(200, 191, 219, 254))) g.FillRectangle(sb, box.X + 6 * s, box.Y + 5 * s, sz.Width - 4 * s, 20 * s);
+            using (var b = new SolidBrush(Color.FromArgb(20, 24, 34))) g.DrawString(text, f, b, box.X + 6 * s, box.Y + 5 * s);
+            if ((t / 500) % 2 == 0)
+                using (var cp = new Pen(Color.FromArgb(20, 24, 34), 1f * s)) g.DrawLine(cp, box.X + 4 * s + sz.Width, box.Y + 7 * s, box.X + 4 * s + sz.Width, box.Y + 23 * s);
+        }
+    }
+
+    static void DrawArrow(Graphics g, float x, float y, float s)
+    {
+        var pts = new[] { new PointF(0, 0), new PointF(0, 17), new PointF(4.2f, 13), new PointF(7.2f, 19.5f), new PointF(9.6f, 18.4f), new PointF(6.7f, 12.2f), new PointF(12, 12.2f) };
+        for (int i = 0; i < pts.Length; i++) pts[i] = new PointF(x + pts[i].X * s, y + pts[i].Y * s);
+        g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.HighQuality;
+        g.FillPolygon(Brushes.White, pts);
+        using (var p = new Pen(Color.Black, 1.1f * s) { LineJoin = System.Drawing.Drawing2D.LineJoin.Round }) g.DrawPolygon(p, pts);
+    }
+    [DllImport("user32.dll")] static extern IntPtr SetThreadDpiAwarenessContext(IntPtr ctx);
 
     public static void Paused(string agent, bool paused)
     {
@@ -2868,7 +3174,7 @@ static class AgentCursor
 
         public OverlayHost()
         {
-            tick.Interval = 15;
+            tick.Interval = 16;   // ~60 fps; stops once every pill is hidden
             tick.Tick += delegate { Step(); };
         }
 
@@ -2925,27 +3231,34 @@ static class AgentCursor
     }
 
     // A light name pill that rides next to the real Windows cursor (below-right of the
-    // arrow, never over its tip). One soft style for every agent.
+    // arrow, never over its tip). One soft style for every agent. Per-pixel alpha via
+    // UpdateLayeredWindow, rendered at the cursor's monitor DPI.
     sealed class PillWindow : Form
     {
         const int WS_EX_LAYERED = 0x80000, WS_EX_TRANSPARENT = 0x20, WS_EX_TOOLWINDOW = 0x80,
                   WS_EX_NOACTIVATE = 0x8000000, WS_EX_TOPMOST = 0x8;
         const uint WDA_NONE = 0, WDA_EXCLUDEFROMCAPTURE = 0x11;
-        const int RippleMs = 420, IdleMs = 3500, FadeMs = 450;
-        static readonly Color Fill = Color.FromArgb(234, 243, 255), Edge = Color.FromArgb(190, 212, 255),
-            Ink = Color.FromArgb(28, 44, 82), Glow = Color.FromArgb(120, 170, 255),
-            PausedFill = Color.FromArgb(255, 230, 176), PausedEdge = Color.FromArgb(246, 196, 110), PausedInk = Color.FromArgb(92, 58, 8);
+        const int RippleMs = 520, IdleMs = 3500, FadeMs = 320;
+
+        static readonly Color Bg = Color.FromArgb(242, 255, 255, 255), Bg2 = Color.FromArgb(236, 244, 246, 252),
+            BgPaused = Color.FromArgb(244, 255, 251, 240), BgPaused2 = Color.FromArgb(238, 255, 243, 222),
+            Border = Color.FromArgb(38, 15, 23, 42), BorderPaused = Color.FromArgb(80, 214, 150, 40),
+            Ink = Color.FromArgb(17, 20, 30), Ink2 = Color.FromArgb(92, 100, 118), Ink2Paused = Color.FromArgb(150, 92, 12),
+            Work = Color.FromArgb(99, 120, 250), Typing = Color.FromArgb(99, 102, 241), Amber = Color.FromArgb(245, 158, 11),
+            Ring = Color.FromArgb(99, 120, 250);
+        static string nameFamily, subFamily;
+        static FontStyle nameStyle = FontStyle.Regular;
 
         readonly string agent;
-        readonly float s;
-        readonly int margin;          // cursor hotspot sits at (margin, margin) inside the window
-        PointF pos;                   // smoothed hotspot position
-        bool placed, paused, dirty;
-        long rippleStart = -100000, lastAct;
+        float s = 1;                  // DPI scale of the cursor's monitor
+        int margin;                   // cursor hotspot sits at (margin, margin) inside the frame
+        PointF pos;
+        bool placed, paused;
+        long rippleStart = -100000, lastAct, appearStart;
         string kind = "move";
         Bitmap frame;
-        int lastSlot = -1;
-        Point lastBlit = new Point(int.MinValue, 0);
+        IntPtr hbmp;
+        bool sizedOnce;
 
         public PillWindow(string agent)
         {
@@ -2953,18 +3266,21 @@ static class AgentCursor
             FormBorderStyle = FormBorderStyle.None;
             ShowInTaskbar = false;
             StartPosition = FormStartPosition.Manual;
-            using (var g = CreateGraphics()) s = Math.Max(1f, g.DpiX / 96f);
-            margin = (int)(22 * s);
-            using (var f = PillFont())
-            using (var g = CreateGraphics())
-            {
-                var sz = g.MeasureString(agent + " · Paused, you're using the PC", f);
-                Size = new Size((int)(margin + 16 * s + sz.Width + 24 * s), (int)(margin + 24 * s + sz.Height + 16 * s));
-            }
+            Size = new Size(1, 1);
             Location = new Point(-32000, -32000);
+            if (nameFamily == null) PickFonts();
         }
 
-        Font PillFont() { return new Font("Segoe UI Semibold", 12f * s, FontStyle.Regular, GraphicsUnit.Pixel); }
+        static void PickFonts()
+        {
+            var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            using (var fc = new System.Drawing.Text.InstalledFontCollection())
+                foreach (var f in fc.Families) names.Add(f.Name);
+            // GDI+ draws variable-font instances at their default (thin) weight, so use the static faces.
+            if (names.Contains("Segoe UI Semibold")) nameFamily = "Segoe UI Semibold";
+            else { nameFamily = "Segoe UI"; nameStyle = FontStyle.Bold; }
+            subFamily = "Segoe UI";
+        }
 
         protected override CreateParams CreateParams
         {
@@ -2988,14 +3304,30 @@ static class AgentCursor
             if (IsHandleCreated) SetWindowDisplayAffinity(Handle, AgentCursor.IncludeInCapture ? WDA_NONE : WDA_EXCLUDEFROMCAPTURE);
         }
 
-        static long Now() { return Environment.TickCount; }
+        // Offscreen preview: a virtual clock, no window handle, nothing shown.
+        bool preview, pvVisible;
+        long fakeNow;
+        int idleMs = IdleMs;
+        public int PvX, PvY;
+        public byte PvAlpha;
+        public Bitmap Frame { get { return frame; } }
+        public bool PvVisible { get { return pvVisible; } }
+        public static PillWindow ForPreview(string agent, float scale, int idle)
+        {
+            var w = new PillWindow(agent);
+            w.preview = true; w.s = scale; w.margin = (int)Math.Ceiling(18 * scale); w.sizedOnce = true; w.idleMs = idle;
+            return w;
+        }
+        public void SetClock(long t) { fakeNow = t; }
+
+        long Now() { return preview ? fakeNow : Environment.TickCount; }
 
         public void Act(string k)
         {
             kind = k ?? "move";
+            if (kind.StartsWith("key:")) { keyLabel = kind.Substring(4); kind = "key"; keyStart = Now(); }
             lastAct = Now();
-            if (kind == "click" && Config.Current.CursorRipple) rippleStart = Now() + 30;
-            dirty = true;
+            if (kind == "click") { bounceStart = Now(); if (Config.Current.CursorRipple) rippleStart = Now() + 30; }
             Appear();
         }
 
@@ -3003,50 +3335,84 @@ static class AgentCursor
         {
             paused = p;
             lastAct = Now();
-            dirty = true;
             if (p) Appear();
         }
 
         void Appear()
         {
+            if (preview)
+            {
+                if (!pvVisible) { placed = false; curW = 0; lastStep = 0; appearStart = Now(); pvVisible = true; }
+                return;
+            }
             if (!IsHandleCreated) { var _ = Handle; }
             ApplyAffinity();
-            if (!Visible) { placed = false; lastBlit = new Point(int.MinValue, 0); Show(); }
+            if (!Visible) { placed = false; sizedOnce = false; curW = 0; lastStep = 0; appearStart = Now(); Show(); }
         }
 
-        // Returns true while visible (the host keeps ticking to follow the cursor).
+        static float DpiScaleAt(int x, int y)
+        {
+            try
+            {
+                IntPtr mon = MonitorFromPoint(new Native.POINT { X = x, Y = y }, 2);
+                uint dx, dy;
+                if (GetDpiForMonitor(mon, 0, out dx, out dy) == 0 && dx > 0) return dx / 96f;
+            }
+            catch { }
+            return 1f;
+        }
+
+        // Returns true while visible (the host keeps ticking ~60 fps to follow the cursor).
         public bool Step(int cx, int cy, int slot)
         {
-            if (!Visible) return false;
+            if (preview ? !pvVisible : !Visible) return false;
             long now = Now();
+            double dt = lastStep == 0 ? 1 / 60.0 : Math.Max(0.001, Math.Min(0.1, (now - lastStep) / 1000.0));
+            lastStep = now;
             if (paused) lastAct = now;
             long idle = now - lastAct;
-            double alpha = idle < IdleMs ? 1.0 : 1.0 - (idle - IdleMs) / (double)FadeMs;
-            if (alpha <= 0) { Hide(); placed = false; return false; }
+            double fade = idle < idleMs ? 1.0 : 1.0 - (idle - idleMs) / (double)FadeMs;
+            if (fade <= 0) { if (preview) pvVisible = false; else Hide(); placed = false; return false; }
+            double fe = fade >= 1 ? 1 : fade * fade * (3 - 2 * fade);
 
-            // Smoothly follow the real cursor; snap on first show.
+            // Spring in: starts at 72%, overshoots a touch, settles.
+            double t = (now - appearStart) / 1000.0;
+            double spring = t >= 0.7 ? 1 : 1 - Math.Exp(-9 * t) * Math.Cos(14 * t);
+            double scale = 0.72 + 0.28 * spring;
+            double alpha = Math.Min(1.0, t / 0.12) * fe;
+            if (fade < 1) scale *= 0.9 + 0.1 * fe;
+            double bt = (now - bounceStart) / 1000.0;   // click bounce
+            if (bt >= 0 && bt < 0.55) scale *= 1 - 0.08 * Math.Exp(-7 * bt) * Math.Sin(20 * bt);
+
+            float follow = (float)(1 - Math.Exp(-dt * 20));
             if (!placed) { pos = new PointF(cx, cy); placed = true; }
-            else { pos = new PointF(pos.X + (cx - pos.X) * 0.38f, pos.Y + (cy - pos.Y) * 0.38f); }
+            else pos = new PointF(pos.X + (cx - pos.X) * follow, pos.Y + (cy - pos.Y) * follow);
             if (Math.Abs(pos.X - cx) < 0.5f && Math.Abs(pos.Y - cy) < 0.5f) pos = new PointF(cx, cy);
 
-            byte a8 = (byte)Math.Max(0, Math.Min(255, alpha * 255));
-            double rp = (now - rippleStart) / (double)RippleMs;
-            bool rippling = rp >= -0.2 && rp <= 1.05;
-            if (dirty || rippling || slot != lastSlot || frame == null) { Render(rp, slot); dirty = rippling; lastSlot = slot; }
+            float ns = preview ? s : DpiScaleAt(cx, cy);
+            if (ns != s || !sizedOnce) { s = ns; margin = (int)Math.Ceiling(18 * s); sizedOnce = true; curW = 0; }
 
-            // Keep the pill on screen near the right / bottom edges.
+            Render(now, dt, (now - rippleStart) / (double)RippleMs, slot, scale);
             int x = (int)Math.Round(pos.X) - margin, y = (int)Math.Round(pos.Y) - margin;
-            var wa = Screen.FromPoint(new Point(cx, cy)).WorkingArea;
-            if (x + Width > wa.Right) x = wa.Right - Width;
-            if (y + Height > wa.Bottom) y = wa.Bottom - Height;
-            Blit(x, y, a8);
+            if (preview)
+            {
+                PvX = x; PvY = y; PvAlpha = (byte)Math.Max(0, Math.Min(255, alpha * 255));
+                return true;
+            }
+            var mi = new MONITORINFO { cbSize = Marshal.SizeOf(typeof(MONITORINFO)) };
+            if (GetMonitorInfo(MonitorFromPoint(new Native.POINT { X = cx, Y = cy }, 2), ref mi))
+            {
+                if (x + frame.Width > mi.rcWork.Right) x = mi.rcWork.Right - frame.Width;
+                if (y + frame.Height > mi.rcWork.Bottom) y = mi.rcWork.Bottom - frame.Height;
+            }
+            Blit(x, y, (byte)Math.Max(0, Math.Min(255, alpha * 255)));
             return true;
         }
 
         static System.Drawing.Drawing2D.GraphicsPath RoundRect(RectangleF r, float rad)
         {
             var p = new System.Drawing.Drawing2D.GraphicsPath();
-            float d = Math.Min(rad * 2, Math.Min(r.Width, r.Height));
+            float d = rad * 2;
             p.AddArc(r.X, r.Y, d, d, 180, 90);
             p.AddArc(r.Right - d, r.Y, d, d, 270, 90);
             p.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
@@ -3055,61 +3421,207 @@ static class AgentCursor
             return p;
         }
 
-        void Render(double ripple, int slot)
+        static System.Drawing.Drawing2D.GraphicsPath Capsule(RectangleF r)
         {
-            int w = Width, h = Height;
-            if (frame == null || frame.Width != w || frame.Height != h)
-            {
-                if (frame != null) frame.Dispose();
-                frame = new Bitmap(w, h, PixelFormat.Format32bppArgb);
-            }
-            using (var g = Graphics.FromImage(frame))
-            {
-                g.Clear(Color.Transparent);
-                g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
-                g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
-                float hx = margin, hy = margin;   // the real cursor's hotspot
+            var p = new System.Drawing.Drawing2D.GraphicsPath();
+            float d = r.Height;
+            p.AddArc(r.X, r.Y, d, d, 90, 180);
+            p.AddArc(r.Right - d, r.Y, d, d, 270, 180);
+            p.CloseFigure();
+            return p;
+        }
 
-                // Subtle click ring around the hotspot (hollow, so the tip stays visible).
-                if (ripple >= 0 && ripple <= 1)
+        Font f1, f2, fk;
+        float fontScale, curW;
+        string keyLabel = "";
+        long keyStart;
+        long lastStep, bounceStart = -100000;
+
+        void Render(long now, double dt, double ripple, int slot, double scale)
+        {
+            bool typing = kind == "type" && !paused;
+            string secondary = paused ? "paused, you're using the PC" : typing ? "typing" : null;
+            if (fontScale != s || f1 == null)
+            {
+                if (f1 != null) { f1.Dispose(); f2.Dispose(); fk.Dispose(); }
+                fk = new Font(nameFamily, 12.5f * s, nameStyle, GraphicsUnit.Pixel);
+                f1 = new Font(nameFamily, 15.5f * s, nameStyle, GraphicsUnit.Pixel);
+                f2 = new Font(subFamily, 13.5f * s, FontStyle.Regular, GraphicsUnit.Pixel);
+                fontScale = s;
+            }
+            using (var sf = (StringFormat)StringFormat.GenericTypographic.Clone())
+            using (var mg = Graphics.FromHwnd(IntPtr.Zero))
+            {
+                sf.FormatFlags |= StringFormatFlags.MeasureTrailingSpaces | StringFormatFlags.NoWrap;
+                mg.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
+                SizeF t1 = mg.MeasureString(agent, f1, 1000, sf);
+                SizeF t2 = secondary == null ? SizeF.Empty : mg.MeasureString(secondary, f2, 1000, sf);
+                // Key chord shown as little keycaps: [Ctrl] + [Shift] + [T]
+                string[] caps = kind == "key" && !paused && keyLabel.Length > 0 ? keyLabel.Split(new[] { " + " }, StringSplitOptions.None) : null;
+                float capPad = 6 * s, capH = 21 * s, plusW = 0, capsW = 0;
+                float[] capW = null;
+                if (caps != null)
                 {
-                    double er = 1 - Math.Pow(1 - ripple, 2);
-                    float r = (float)(5 * s + 11 * s * er);
-                    int a = (int)(110 * (1 - ripple));
-                    using (var pen = new Pen(Color.FromArgb(a, Glow), 1.6f * s))
-                        g.DrawEllipse(pen, hx - r, hy - r, r * 2, r * 2);
+                    capW = new float[caps.Length];
+                    plusW = mg.MeasureString("+", f2, 1000, sf).Width + 8 * s;
+                    for (int i = 0; i < caps.Length; i++)
+                    {
+                        capW[i] = Math.Max(capH, mg.MeasureString(caps[i], fk, 1000, sf).Width + capPad * 2);
+                        capsW += capW[i] + (i > 0 ? plusW : 0);
+                    }
                 }
 
-                Color fill = paused ? PausedFill : Fill, edge = paused ? PausedEdge : Edge, ink = paused ? PausedInk : Ink;
-                string label = paused ? agent + " · Paused, you're using the PC" : kind == "type" ? agent + " · typing" : agent;
-                using (var f = PillFont())
+                float h = (float)Math.Round(36 * s), logo = 26 * s, padL = (h - logo) / 2, gap = 9 * s, gap2 = 7 * s, padR = 16 * s;
+                float dotsW = typing ? 5 * s + 16 * s : 0;
+                float target = padL + logo + gap + t1.Width + (secondary == null ? 0 : gap2 + t2.Width) + dotsW + (caps == null ? 0 : 10 * s + capsW) + padR;
+                if (caps != null) target -= 6 * s;
+                // Smooth width morph when the text changes.
+                if (curW <= 0) curW = target;
+                else
                 {
-                    var sz = g.MeasureString(label, f);
-                    // Below-right of the arrow: clear of the tip and most of the arrow body.
-                    float px = hx + 16 * s, py = hy + 22 * s + slot * (sz.Height + 10 * s);
-                    if (py + sz.Height + 8 * s > h) py = hy + 22 * s;
-                    var rect = new RectangleF(px, py, sz.Width + 16 * s, sz.Height + 6 * s);
-                    float rad = rect.Height / 2;
-                    using (var path = RoundRect(rect, rad))
+                    curW += (target - curW) * (float)(1 - Math.Exp(-dt * 16));
+                    if (Math.Abs(curW - target) < 0.5f) curW = target;
+                }
+                float w = curW;
+                float px = margin + 14 * s, py = margin + 20 * s + slot * (h + 10 * s);
+                float pad = 22 * s;
+                int fw = (int)Math.Ceiling(px + Math.Max(w, target) * 1.06f + pad), fh = (int)Math.Ceiling(py + h * 1.06f + pad);
+                if (frame == null || frame.Width < fw || frame.Height < fh || frame.Width > fw + 60 * s)
+                {
+                    if (frame != null) frame.Dispose();
+                    frame = new Bitmap(fw + (int)(24 * s), fh, PixelFormat.Format32bppPArgb);
+                }
+                using (var g = Graphics.FromImage(frame))
+                {
+                    g.Clear(Color.Transparent);
+                    g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.HighQuality;
+                    g.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.HighQuality;
+                    g.CompositingQuality = System.Drawing.Drawing2D.CompositingQuality.HighQuality;
+                    g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+                    g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
+
+                    // Subtle click ripple around the real cursor tip (hollow, the tip stays visible).
+                    if (ripple >= 0 && ripple <= 1)
                     {
-                        for (int gl = 3; gl >= 1; gl--)
-                            using (var gp = new Pen(Color.FromArgb(14, paused ? PausedEdge : Glow), gl * 3.2f * s)) g.DrawPath(gp, path);
-                        using (var shp = RoundRect(new RectangleF(rect.X, rect.Y + 1.4f * s, rect.Width, rect.Height), rad))
-                        using (var br = new SolidBrush(Color.FromArgb(28, 20, 30, 60))) g.FillPath(br, shp);
-                        using (var br = new SolidBrush(fill)) g.FillPath(br, path);
-                        using (var pen = new Pen(edge, 1.1f * s)) g.DrawPath(pen, path);
+                        double er = 1 - Math.Pow(1 - ripple, 3);
+                        float r = (float)(4 * s + 14 * s * er);
+                        using (var pen = new Pen(Color.FromArgb((int)(150 * (1 - ripple)), Ring), 2f * s))
+                            g.DrawEllipse(pen, margin - r, margin - r, r * 2, r * 2);
                     }
-                    using (var br = new SolidBrush(ink))
-                        g.DrawString(label, f, br, px + 8 * s, py + 3 * s);
+
+                    g.TranslateTransform(px, py + h / 2);
+                    g.ScaleTransform((float)scale, (float)scale);
+                    g.TranslateTransform(-px, -(py + h / 2));
+
+                    var rect = new RectangleF(px, py, w, h);
+                    // Soft drop shadow.
+                    for (int i = 8; i >= 1; i--)
+                    {
+                        float e = i * 1.25f * s;
+                        using (var sp = Capsule(new RectangleF(rect.X - e, rect.Y - e + 3f * s, rect.Width + 2 * e, rect.Height + 2 * e)))
+                        using (var br = new SolidBrush(Color.FromArgb((int)(4 + (8 - i) * 2.1), 15, 23, 42)))
+                            g.FillPath(br, sp);
+                    }
+                    using (var path = Capsule(rect))
+                    {
+                        using (var br = new System.Drawing.Drawing2D.LinearGradientBrush(new RectangleF(rect.X, rect.Y - 1, rect.Width, rect.Height + 2),
+                            paused ? BgPaused : Bg, paused ? BgPaused2 : Bg2, 90f))
+                            g.FillPath(br, path);
+
+                        var clip = g.Clip;
+                        g.SetClip(path, System.Drawing.Drawing2D.CombineMode.Intersect);
+                        // Shimmer sweep while working.
+                        if (!paused && !typing && kind != "key")
+                        {
+                            double sp = (now % 2400) / 2400.0;
+                            float band = 46 * s, bx = (float)(rect.X - band * 2 + (rect.Width + band * 3) * sp);
+                            using (var sh = new System.Drawing.Drawing2D.LinearGradientBrush(new RectangleF(bx, rect.Y, band, rect.Height),
+                                Color.FromArgb(0, 255, 255, 255), Color.FromArgb(0, 255, 255, 255), 20f))
+                            {
+                                var cb = new System.Drawing.Drawing2D.ColorBlend
+                                {
+                                    Colors = new[] { Color.FromArgb(0, 210, 225, 255), Color.FromArgb(120, 214, 228, 255), Color.FromArgb(0, 210, 225, 255) },
+                                    Positions = new[] { 0f, 0.5f, 1f }
+                                };
+                                sh.InterpolationColors = cb;
+                                g.FillRectangle(sh, bx, rect.Y, band, rect.Height);
+                            }
+                        }
+                        // top sheen
+                        using (var sheen = new System.Drawing.Drawing2D.LinearGradientBrush(new RectangleF(rect.X, rect.Y, rect.Width, rect.Height * 0.55f),
+                            Color.FromArgb(150, 255, 255, 255), Color.FromArgb(0, 255, 255, 255), 90f))
+                            g.FillRectangle(sheen, rect.X, rect.Y, rect.Width, rect.Height * 0.55f - 0.5f);
+
+                        // Logo, with a soft pulse ring.
+                        float lx = rect.X + padL, ly = rect.Y + padL;
+                        double pp = (now % (paused ? 1800 : 1400)) / (double)(paused ? 1800 : 1400);
+                        if (!typing)
+                        {
+                            float ex = (float)(5 * s * pp);
+                            using (var br = new SolidBrush(Color.FromArgb((int)(90 * (1 - pp) * (1 - pp)), paused ? Amber : Work)))
+                                g.FillEllipse(br, lx - ex, ly - ex, logo + 2 * ex, logo + 2 * ex);
+                        }
+                        ReachLogo.Draw(g, new RectangleF(lx, ly, logo, logo), paused);
+
+                        // Text.
+                        float tx = lx + logo + gap;
+                        using (var b1 = new SolidBrush(Ink))
+                            g.DrawString(agent, f1, b1, tx, rect.Y + (h - t1.Height) / 2 - 0.5f * s, sf);
+                        float ex2 = tx + t1.Width + gap2;
+                        if (secondary != null)
+                            using (var b2 = new SolidBrush(paused ? Ink2Paused : Ink2))
+                                g.DrawString(secondary, f2, b2, ex2, rect.Y + (h - t2.Height) / 2 - 0.2f * s, sf);
+                        if (caps != null)
+                        {
+                            float kx = tx + t1.Width + 10 * s, ky = rect.Y + (h - capH) / 2;
+                            double kp = Math.Min(1, (now - keyStart) / 260.0);       // keycaps pop in
+                            for (int i = 0; i < caps.Length; i++)
+                            {
+                                if (i > 0)
+                                {
+                                    using (var bp = new SolidBrush(Ink2))
+                                        g.DrawString("+", f2, bp, kx + 4 * s, rect.Y + (h - t1.Height * 0.86f) / 2, sf);
+                                    kx += plusW;
+                                }
+                                double ci = Math.Max(0, Math.Min(1, kp * caps.Length - i * 0.6));
+                                float press = (float)(1.5 * s * (1 - ci));
+                                var kr = new RectangleF(kx, ky + press, capW[i], capH);
+                                using (var kpth = RoundRect(new RectangleF(kr.X, kr.Y + 1.5f * s, kr.Width, kr.Height), 6 * s))
+                                using (var kb = new SolidBrush(Color.FromArgb(30, 15, 23, 42))) g.FillPath(kb, kpth);
+                                using (var kpth = RoundRect(kr, 6 * s))
+                                {
+                                    using (var kb = new System.Drawing.Drawing2D.LinearGradientBrush(kr, Color.White, Color.FromArgb(255, 238, 241, 248), 90f)) g.FillPath(kb, kpth);
+                                    using (var kpen = new Pen(Color.FromArgb(46, 15, 23, 42), 1f * s)) g.DrawPath(kpen, kpth);
+                                }
+                                using (var tb = new SolidBrush(Ink))
+                                using (var cf = new StringFormat(sf) { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center })
+                                    g.DrawString(caps[i], fk, tb, new RectangleF(kr.X, kr.Y - 0.5f * s, kr.Width, kr.Height), cf);
+                                kx += capW[i];
+                            }
+                        }
+                        // Typing dots.
+                        if (typing)
+                        {
+                            float dx = ex2 + t2.Width + 5 * s, dy = rect.Y + h / 2 + 1.5f * s, r = 2.1f * s;
+                            for (int i = 0; i < 3; i++)
+                            {
+                                double ph = Math.Sin(now / 1000.0 * Math.PI * 2 / 0.9 - i * 0.7);
+                                double up = Math.Max(0, ph);
+                                using (var br = new SolidBrush(Color.FromArgb((int)(110 + 145 * up), Typing)))
+                                    g.FillEllipse(br, dx + i * 6 * s - r, (float)(dy - 3 * s * up) - r, r * 2, r * 2);
+                            }
+                        }
+                        g.Clip = clip;
+                        using (var pen = new Pen(paused ? BorderPaused : Border, 1f * s)) g.DrawPath(pen, path);
+                    }
                 }
             }
             if (hbmp != IntPtr.Zero) { DeleteObject(hbmp); hbmp = IntPtr.Zero; }
         }
 
-        IntPtr hbmp;
-
         void Blit(int x, int y, byte alpha)
         {
+            // Format32bppPArgb -> premultiplied DIB for UpdateLayeredWindow.
             if (hbmp == IntPtr.Zero) hbmp = frame.GetHbitmap(Color.FromArgb(0));
             IntPtr screenDc = GetDC(IntPtr.Zero);
             IntPtr memDc = CreateCompatibleDC(screenDc);
@@ -3121,9 +3633,7 @@ static class AgentCursor
                 var dst = new Native.POINT { X = x, Y = y };
                 var blend = new BLENDFUNCTION { BlendOp = 0, BlendFlags = 0, SourceConstantAlpha = alpha, AlphaFormat = 1 };
                 UpdateLayeredWindow(Handle, screenDc, ref dst, ref size, memDc, ref src, 0, ref blend, 2 /*ULW_ALPHA*/);
-                if (lastBlit.X == int.MinValue)
-                    SetWindowPos(Handle, new IntPtr(-1), 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010); // stay topmost
-                lastBlit = new Point(x, y);
+                SetWindowPos(Handle, new IntPtr(-1), 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010 | 0x0200); // topmost, no owner z-change
             }
             finally
             {
@@ -3138,12 +3648,71 @@ static class AgentCursor
         [DllImport("user32.dll")] static extern bool UpdateLayeredWindow(IntPtr h, IntPtr hdcDst, ref Native.POINT pptDst, ref SIZE psize, IntPtr hdcSrc, ref Native.POINT pptSrc, int key, ref BLENDFUNCTION blend, int flags);
         [DllImport("user32.dll")] static extern bool SetWindowDisplayAffinity(IntPtr h, uint aff);
         [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint f);
+        [DllImport("user32.dll")] static extern IntPtr MonitorFromPoint(Native.POINT pt, uint flags);
+        [StructLayout(LayoutKind.Sequential)] struct MONITORINFO { public int cbSize; public Native.RECT rcMonitor, rcWork; public uint dwFlags; }
+        [DllImport("user32.dll")] static extern bool GetMonitorInfo(IntPtr mon, ref MONITORINFO mi);
+        [DllImport("shcore.dll")] static extern int GetDpiForMonitor(IntPtr mon, int type, out uint dx, out uint dy);
         [DllImport("user32.dll")] static extern IntPtr GetDC(IntPtr h);
         [DllImport("user32.dll")] static extern int ReleaseDC(IntPtr h, IntPtr dc);
         [DllImport("gdi32.dll")] static extern IntPtr CreateCompatibleDC(IntPtr dc);
         [DllImport("gdi32.dll")] static extern bool DeleteDC(IntPtr dc);
         [DllImport("gdi32.dll")] static extern IntPtr SelectObject(IntPtr dc, IntPtr o);
         [DllImport("gdi32.dll")] static extern bool DeleteObject(IntPtr o);
+    }
+}
+
+// The Reach mark: a soft gradient circle with a white pointer reaching up-left.
+static class ReachLogo
+{
+    public static void Draw(Graphics g, RectangleF r, bool paused)
+    {
+        var oldMode = g.SmoothingMode;
+        g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.HighQuality;
+        Color a = paused ? Color.FromArgb(255, 252, 196, 74) : Color.FromArgb(255, 99, 140, 255);
+        Color b = paused ? Color.FromArgb(255, 234, 128, 12) : Color.FromArgb(255, 124, 77, 246);
+        using (var br = new System.Drawing.Drawing2D.LinearGradientBrush(r, a, b, 45f)) g.FillEllipse(br, r);
+        // inner glow at the top
+        using (var hp = new System.Drawing.Drawing2D.GraphicsPath())
+        {
+            hp.AddEllipse(r.X + r.Width * 0.12f, r.Y + r.Height * 0.04f, r.Width * 0.76f, r.Height * 0.5f);
+            using (var hb = new System.Drawing.Drawing2D.PathGradientBrush(hp))
+            {
+                hb.CenterColor = Color.FromArgb(70, 255, 255, 255);
+                hb.SurroundColors = new[] { Color.FromArgb(0, 255, 255, 255) };
+                g.FillPath(hb, hp);
+            }
+        }
+        // pointer arrow, 12.5 x 18.5 units, centered slightly right/down of center
+        float u = r.Height * 0.54f / 18.5f;
+        float ox = r.X + r.Width * 0.5f - 12.5f * u * 0.40f, oy = r.Y + r.Height * 0.5f - 18.5f * u * 0.50f;
+        var pts = new[] { new PointF(0, 0), new PointF(0, 15.5f), new PointF(4.2f, 11.8f), new PointF(7.1f, 18.2f), new PointF(9.9f, 17f), new PointF(7.1f, 10.8f), new PointF(12.5f, 10.8f) };
+        for (int i = 0; i < pts.Length; i++) pts[i] = new PointF(ox + pts[i].X * u, oy + pts[i].Y * u);
+        using (var ap = new System.Drawing.Drawing2D.GraphicsPath())
+        {
+            ap.AddPolygon(pts);
+            using (var sh = new SolidBrush(Color.FromArgb(50, 20, 10, 60)))
+            {
+                var m = new System.Drawing.Drawing2D.Matrix(); m.Translate(0, r.Height * 0.035f);
+                using (var sp = (System.Drawing.Drawing2D.GraphicsPath)ap.Clone()) { sp.Transform(m); g.FillPath(sh, sp); }
+            }
+            g.FillPath(Brushes.White, ap);
+            using (var pen = new Pen(Color.White, Math.Max(1f, r.Height * 0.05f)) { LineJoin = System.Drawing.Drawing2D.LineJoin.Round })
+                g.DrawPath(pen, ap);
+        }
+        g.SmoothingMode = oldMode;
+    }
+
+    public static Bitmap Render(int size, bool paused)
+    {
+        var bmp = new Bitmap(size, size, PixelFormat.Format32bppArgb);
+        using (var g = Graphics.FromImage(bmp))
+        {
+            g.Clear(Color.Transparent);
+            g.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.HighQuality;
+            float m = Math.Max(1, size / 32f);
+            Draw(g, new RectangleF(m, m, size - 2 * m, size - 2 * m), paused);
+        }
+        return bmp;
     }
 }
 
@@ -3307,6 +3876,34 @@ static class Program
         RebindConsole();
         Directory.CreateDirectory(Paths.Dir);
         Config.Load();
+
+        if (args.Length >= 1 && args[0].Equals("selftest", StringComparison.OrdinalIgnoreCase))
+        {
+            string r = Engine.SelfTest();
+            Console.WriteLine(r);
+            return r.Contains("FAIL") ? 1 : 0;
+        }
+
+        if (args.Length >= 1 && args[0].Equals("pill-preview", StringComparison.OrdinalIgnoreCase))
+        {
+            string dir = Path.Combine(Paths.Dir, "pill-preview"), agent = "Meridian";
+            float sc = 2f;
+            for (int i = 1; i < args.Length; i++)
+            {
+                if (args[i] == "--out" && i + 1 < args.Length) dir = args[++i];
+                else if (args[i] == "--agent" && i + 1 < args.Length) agent = args[++i];
+                else if (args[i] == "--scale" && i + 1 < args.Length) sc = float.Parse(args[++i], System.Globalization.CultureInfo.InvariantCulture);
+            }
+            Console.WriteLine(AgentCursor.Preview(dir, agent, sc));
+            return 0;
+        }
+
+        if (args.Length >= 2 && args[0].Equals("logo", StringComparison.OrdinalIgnoreCase))
+        {
+            using (var bmp = ReachLogo.Render(args.Length > 2 ? int.Parse(args[2]) : 256, false)) bmp.Save(args[1], ImageFormat.Png);
+            Console.WriteLine("wrote " + args[1]);
+            return 0;
+        }
 
         if (args.Length == 0)
         {
