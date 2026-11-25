@@ -1,0 +1,14 @@
+[package]
+name = "reach"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "reach"
+path = "src/main.rs"
+
+[dependencies]
+reach-core = { path = "../reach-core", features = ["server"] }
+serde_json.workspace = true
+windows.workspace = true

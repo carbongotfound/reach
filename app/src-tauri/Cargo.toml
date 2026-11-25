@@ -1,0 +1,28 @@
+[package]
+name = "reach-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "reach-app"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+reach-core = { path = "../../crates/reach-core", features = ["server"] }
+serde_json.workspace = true
+windows.workspace = true
+serde.workspace = true
+ureq = { version = "2.12", default-features = false, features = ["native-tls"] }
+native-tls = "0.2"
+sha2 = "0.10"
+semver = "1"
+
+[features]
+# Embed dist/ (plain cargo builds; the tauri CLI also sets this for bundles).
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]

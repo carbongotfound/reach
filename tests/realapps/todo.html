@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>To-do list</title>
+<style>
+  body { font: 16px/1.5 "Segoe UI", system-ui, sans-serif; color: #1d1d1f; background: #fff; max-width: 520px; margin: 32px auto; padding: 0 20px; }
+  h1 { font-size: 26px; margin: 0 0 16px; }
+  form { display: flex; gap: 8px; margin-bottom: 16px; }
+  input[type=text] { flex: 1; font: inherit; padding: 8px 10px; border: 1px solid #c4c7cc; border-radius: 8px; }
+  button { font: inherit; padding: 8px 14px; border: 0; border-radius: 8px; background: #1d1d1f; color: #fff; }
+  ul { list-style: none; padding: 0; margin: 0; } li { display: flex; gap: 10px; align-items: center; padding: 8px 0; border-bottom: 1px solid #eceef1; }
+  .empty { color: #5f6368; }
+</style>
+</head>
+<body>
+<!-- A neutral local page for the real-app tests (Edge). Nothing is sent or saved anywhere. -->
+<h1>To-do list</h1>
+<form id="f"><input id="t" type="text" aria-label="New item" placeholder="Add an item"><button type="submit">Add</button></form>
+<ul id="l" aria-label="Items"></ul>
+<p class="empty" id="e">Nothing on the list yet.</p>
+<script>
+  const f = document.getElementById('f'), t = document.getElementById('t'), l = document.getElementById('l'), e = document.getElementById('e');
+  f.addEventListener('submit', (ev) => {
+    ev.preventDefault();
+    const v = t.value.trim(); if (!v) return;
+    const li = document.createElement('li'), c = document.createElement('input');
+    c.type = 'checkbox'; c.setAttribute('aria-label', v);
+    li.append(c, document.createTextNode(v)); l.append(li);
+    t.value = ''; e.hidden = true; t.focus();
+  });
+</script>
+</body>
+</html>
