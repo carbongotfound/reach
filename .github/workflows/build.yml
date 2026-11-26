@@ -32,6 +32,11 @@ jobs:
         working-directory: app
         run: npm ci
 
+      # the app crate embeds app/dist, so the tests need the frontend built first
+      - name: Build the frontend
+        working-directory: app
+        run: npm run build
+
       - name: Unit tests
         run: cargo test --release -p reach-core -p reach-app
 
